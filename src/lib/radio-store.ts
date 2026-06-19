@@ -1,4 +1,4 @@
-// napps/radio/src/lib/radio-store.ts
+// napplets/radio/src/lib/radio-store.ts
 // Radio station state — pure TypeScript, no Svelte runes.
 // Keep this as .ts (not .svelte.ts) so vitest can import without Svelte compiler.
 
