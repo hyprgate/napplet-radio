@@ -77,10 +77,12 @@
     return `30311:${station.pubkey}:${station.id}`;
   }
 
-  function stationChatContext(station: RadioStation): RuntimePlaybackChatContext | undefined {
-    return station.chatRelays.length > 0
-      ? { streamAddr: stationStreamAddr(station), title: station.name, chatRelays: station.chatRelays }
-      : undefined;
+  function stationChatContext(station: RadioStation): RuntimePlaybackChatContext {
+    return {
+      streamAddr: stationStreamAddr(station),
+      title: station.name,
+      ...(station.chatRelays.length > 0 ? { chatRelays: station.chatRelays } : {}),
+    };
   }
 
   function buildStationQueue(station: RadioStation): {
@@ -106,7 +108,7 @@
         detail: stationContextDetail(item.station),
         index,
         total,
-        ...(stationChatContext(item.station) ? { chat: stationChatContext(item.station) } : {}),
+        chat: stationChatContext(item.station),
       },
     }));
     const queueIndex = playable.findIndex((item) => item.station.id === station.id);
@@ -118,7 +120,7 @@
         label: 'Radio',
         detail: stationContextDetail(station),
         ...(queueIndex >= 0 ? { index: queueIndex, total } : {}),
-        ...(stationChatContext(station) ? { chat: stationChatContext(station) } : {}),
+        chat: stationChatContext(station),
       },
       queue,
       queueIndex: queueIndex >= 0 ? queueIndex : undefined,
