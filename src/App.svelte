@@ -282,7 +282,8 @@
 
     sub = relay.subscribe(
       { kinds: [31237], limit: STATION_PAGE_LIMIT, ...(until === undefined ? {} : { until }) },
-      (event) => {
+      (result) => {
+        const event = result.event as NostrEvent;
         if (requestId !== pageRequestId) return;
         pageEventCount++;
         noteSeenStationEvent(event);

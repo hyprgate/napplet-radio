@@ -5,6 +5,8 @@ import { relay } from '@napplet/sdk';
 import { requestRuntimePlayback } from '@hyprgate/utils';
 import type { NostrEvent } from '@hyprgate/types';
 
+type RelayEventResult = { event: NostrEvent };
+
 vi.mock('@napplet/sdk', () => ({
   relay: {
     subscribe: vi.fn().mockReturnValue({ close: vi.fn() }),
@@ -75,11 +77,11 @@ describe('radio app relay subscription', () => {
     const component = mount(App, { target: document.body });
     await Promise.resolve();
 
-    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (event: NostrEvent) => void;
+    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (result: RelayEventResult) => void;
     const eoseCallback = vi.mocked(relay.subscribe).mock.calls[0]![2] as () => void;
     const firstCreatedAt = 1_700_000_000;
     for (let index = 0; index < 1000; index++) {
-      eventCallback(makeStationEvent({ created_at: firstCreatedAt - index }));
+      eventCallback({ event: makeStationEvent({ created_at: firstCreatedAt - index }) });
     }
     eoseCallback();
     await tick();
@@ -103,9 +105,9 @@ describe('radio app relay subscription', () => {
     const component = mount(App, { target: document.body });
     await Promise.resolve();
 
-    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (event: NostrEvent) => void;
+    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (result: RelayEventResult) => void;
     const eoseCallback = vi.mocked(relay.subscribe).mock.calls[0]![2] as () => void;
-    eventCallback(makeStationEvent());
+    eventCallback({ event: makeStationEvent() });
     eoseCallback();
     await tick();
 
@@ -119,8 +121,8 @@ describe('radio app relay subscription', () => {
     const component = mount(App, { target: document.body });
     await Promise.resolve();
 
-    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (event: NostrEvent) => void;
-    eventCallback(makeStationEvent());
+    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (result: RelayEventResult) => void;
+    eventCallback({ event: makeStationEvent() });
     await tick();
 
     const stationButton = document.querySelector<HTMLButtonElement>('button[title="Phase 94 Radio"]');
