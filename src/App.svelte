@@ -15,10 +15,12 @@
     type RuntimePlayerSubscription,
   } from '@hyprgate/utils';
   import { radioStore, parseKind31237 } from './lib/radio-store.js';
+  import { coverImageResolves } from './lib/radio-cover-image.js';
   import { getNextRadioPageRequest } from './lib/radio-pagination.js';
   import StationCard from './components/StationCard.svelte';
   import type { RadioStation } from './lib/radio-store.js';
   import type { Subscription } from '@napplet/sdk';
+  import type { NostrEvent } from '@hyprgate/types';
 
   const WAVEFUNC_RELAY = 'wss://relay.wavefunc.live';
   const STATION_PAGE_LIMIT = 1000;
@@ -29,7 +31,11 @@
 
   let stations = $derived.by(() => { version; return radioStore.getStations(); });
   let playingId = $derived.by(() => { version; return radioStore.getPlaying(); });
-  let loading = $derived.by(() => { version; return radioStore.isLoading(); });
+  let coverChecksPending = $state(0);
+  let loading = $derived.by(() => {
+    version;
+    return radioStore.isLoading() || coverChecksPending > 0;
+  });
   let playbackStatus = $state<RuntimePlayerStatus | null>(null);
   let activeGenre = $state<string | null>(null);
 
@@ -64,6 +70,20 @@
   let pageRequestId = 0;
   let restoredLastStation = false;
   let destroyed = false;
+  const coverCheckPromises = new Set<Promise<void>>();
+
+  function trackCoverCheck(promise: Promise<void>): void {
+    coverCheckPromises.add(promise);
+    void promise.finally(() => {
+      coverCheckPromises.delete(promise);
+    });
+  }
+
+  async function waitForCoverChecks(requestId: number): Promise<void> {
+    while (!destroyed && requestId === pageRequestId && coverCheckPromises.size > 0) {
+      await Promise.allSettled([...coverCheckPromises]);
+    }
+  }
 
   function primaryStreamUrl(station: RadioStation): string | null {
     return (station.streams.find((stream) => stream.primary) ?? station.streams[0])?.url ?? null;
@@ -247,6 +267,21 @@
       : Math.min(oldestSeenCreatedAt, event.created_at);
   }
 
+  async function addStationAfterCoverImageResolves(station: RadioStation, requestId: number): Promise<void> {
+    coverChecksPending += 1;
+    notifyUpdate();
+    try {
+      const validCover = await coverImageResolves(station.thumbnail);
+      if (!validCover || destroyed || requestId !== pageRequestId) return;
+      radioStore.addStation(station);
+    } finally {
+      if (!destroyed) {
+        coverChecksPending = Math.max(0, coverChecksPending - 1);
+        notifyUpdate();
+      }
+    }
+  }
+
   async function restoreLastStationOnce(): Promise<void> {
     if (restoredLastStation) return;
     restoredLastStation = true;
@@ -263,7 +298,7 @@
 
   function loadNextStationPage(): void {
     const pageRequest = getNextRadioPageRequest({
-      isLoading: radioStore.isLoading(),
+      isLoading: radioStore.isLoading() || coverChecksPending > 0,
       loadingMore,
       hasMore,
       loadedStationCount: radioStore.getStations().length,
@@ -288,7 +323,10 @@
         pageEventCount++;
         noteSeenStationEvent(event);
         const station = parseKind31237(event);
-        if (station) { radioStore.addStation(station); notifyUpdate(); }
+        if (station) {
+          const coverCheck = addStationAfterCoverImageResolves(station, requestId);
+          trackCoverCheck(coverCheck);
+        }
       },
       async () => {
         if (requestId !== pageRequestId) return;
@@ -297,6 +335,9 @@
         if (pageEventCount < STATION_PAGE_LIMIT || pageEventCount === 0 || oldestSeenCreatedAt === cursorBefore) {
           hasMore = false;
         }
+
+        await waitForCoverChecks(requestId);
+        if (requestId !== pageRequestId) return;
 
         loadingMore = false;
         radioStore.setLoading(false);
@@ -345,6 +386,7 @@
     radioStore.reset();
     radioStore.setLoading(false);
     loadingMore = false;
+    coverChecksPending = 0;
     hasMore = true;
     oldestSeenCreatedAt = null;
     pageRequestId = 0;
