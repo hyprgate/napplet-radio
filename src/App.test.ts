@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 import App from './App.svelte';
-import { relay } from '@napplet/sdk';
+import { inc, relay } from '@napplet/sdk';
 import { requestRuntimePlayback } from '@hyprgate/utils';
 import type { NostrEvent } from '@hyprgate/types';
 
@@ -185,6 +185,31 @@ describe('radio app relay subscription', () => {
         },
       }),
     }));
+
+    unmount(component);
+  });
+
+  it('responds to a one-event stream-context request with only its optional payload', async () => {
+    const component = mount(App, { target: document.body });
+    await waitForInitialSubscription();
+
+    const [, callback] = vi.mocked(inc.on).mock.calls.find(
+      ([topic]) => topic === 'stream:current-context-get',
+    )!;
+    const payload = { requestId: 'warm-context-request' };
+    callback!({
+      topic: 'stream:current-context-get',
+      sender: 'runtime-attested-stream',
+      payload,
+    });
+
+    expect(inc.emit).toHaveBeenCalledWith(
+      'stream:current-context',
+      JSON.stringify({
+        context: { streamAddr: null, title: null, chatRelays: [] },
+        payload,
+      }),
+    );
 
     unmount(component);
   });

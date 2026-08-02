@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { relay, inc as ipc } from '@napplet/sdk';
+  import { relay, inc } from '@napplet/sdk';
   import {
     createStreamChannelSwitchPayload,
     createStreamCurrentContextPayload,
@@ -231,7 +231,7 @@
     // 31237 events; their live chat follows NIP-53 "30311:<pubkey>:<d-tag>" so the
     // chat napp can subscribe with '#a'.
     const streamAddr = stationStreamAddr(station);
-    ipc.emit('stream:channel-switch', [], JSON.stringify(
+    inc.emit('stream:channel-switch', JSON.stringify(
       createStreamChannelSwitchPayload({
         streamId: streamAddr,
         streamUrl,
@@ -394,16 +394,16 @@
     loadNextStationPage();
 
     // Pull-on-mount responder: respond to stream:current-context-get requests
-    contextSub = ipc.on('stream:current-context-get', (payload) => {
+    contextSub = inc.on('stream:current-context-get', (event) => {
       const current = radioStore.getPlaying();
       const station = current ? radioStore.getStation(current) : undefined;
       const streamAddr = station ? stationStreamAddr(station) : null;
-      ipc.emit('stream:current-context', [], JSON.stringify(
+      inc.emit('stream:current-context', JSON.stringify(
         createStreamCurrentContextPayload(
           station
             ? { streamAddr, title: station.name, chatRelays: station.chatRelays }
             : { streamAddr: null, title: null, chatRelays: [] },
-          payload,
+          event.payload,
         ),
       ));
     });
