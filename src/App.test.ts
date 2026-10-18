@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 import App from './App.svelte';
-import { inc, relay } from '@napplet/sdk';
-import { requestRuntimePlayback } from '@hyprgate/utils';
+import { inc, relay, storage } from '@napplet/sdk';
+import { requestRuntimePlayback, subscribeRuntimePlayback } from '@hyprgate/utils';
 import type { NostrEvent } from '@hyprgate/types';
 
 type RelayEventResult = { event: NostrEvent };
@@ -93,12 +93,46 @@ describe('radio app relay subscription', () => {
     });
   }
 
-  it('subscribes to WaveFunc stations through an explicit relay hint with the expanded station cap', async () => {
+  it.each(['idle', null] as const)('keeps radio selected through loading/pause and clears stopped or released playback (%s)', async (status) => {
+    const component = mount(App, { target: document.body });
+    await waitForInitialSubscription();
+    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (result: RelayEventResult) => void;
+    eventCallback({ event: makeStationEvent() });
+    await vi.waitFor(() => expect(document.querySelector('button[title="Phase 94 Radio"]')).not.toBeNull());
+    const card = document.querySelector<HTMLButtonElement>('button[title="Phase 94 Radio"]')!;
+    card.click();
+    await vi.waitFor(() => expect(subscribeRuntimePlayback).toHaveBeenCalled());
+    const onState = vi.mocked(subscribeRuntimePlayback).mock.calls[0]![1];
+    const runtimeState = { sessionId: 'radio-session', windowId: '', position: 0, duration: null, volume: 0.7, muted: false };
+    for (const [state, badge] of [['loading', 'TUNING'], ['playing', 'LIVE'], ['paused', 'PAUSED']] as const) {
+      onState({ ...runtimeState, state });
+      await tick();
+      expect(card.getAttribute('aria-pressed')).toBe('true');
+      expect(card.querySelector('.badge')?.textContent?.trim()).toBe(badge);
+      expect(card.querySelector('.is-buffering') !== null).toBe(state === 'loading');
+      expect(card.querySelector('.live-dot') !== null).toBe(state !== 'paused');
+    }
+    onState(status === null ? null : { ...runtimeState, state: status });
+    await tick();
+    expect(card.getAttribute('aria-pressed')).toBe('false');
+    expect(card.querySelector('.badge')).toBeNull();
+    expect(storage.removeItem).toHaveBeenCalledWith('last-station-id');
+    const [, onContext] = vi.mocked(inc.on).mock.calls.find(([topic]) => topic === 'stream:current-context-get')!;
+    onContext!({ topic: 'stream:current-context-get', sender: 'chat', payload: {} });
+    expect(inc.emit).toHaveBeenLastCalledWith('stream:current-context', JSON.stringify({
+      context: { streamAddr: null, title: null, chatRelays: [] }, payload: {},
+    }));
+    card.click();
+    await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(2));
+    await unmount(component);
+  });
+
+  it('keeps the station request within WaveFunc’s 500-event maximum', async () => {
     const component = mount(App, { target: document.body });
     await waitForInitialSubscription();
 
     expect(relay.subscribe).toHaveBeenCalledWith(
-      { kinds: [31237], limit: 1000 },
+      { kinds: [31237], limit: 500 },
       expect.any(Function),
       expect.any(Function),
       { relay: 'wss://relay.wavefunc.live' },
@@ -118,7 +152,7 @@ describe('radio app relay subscription', () => {
     const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (result: RelayEventResult) => void;
     const eoseCallback = vi.mocked(relay.subscribe).mock.calls[0]![2] as () => void;
     const firstCreatedAt = 1_700_000_000;
-    for (let index = 0; index < 1000; index++) {
+    for (let index = 0; index < 500; index++) {
       eventCallback({ event: makeStationEvent({ created_at: firstCreatedAt - index }) });
     }
     eoseCallback();
@@ -134,8 +168,8 @@ describe('radio app relay subscription', () => {
     expect(relay.subscribe).toHaveBeenCalledTimes(2);
     expect(vi.mocked(relay.subscribe).mock.calls[1]![0]).toMatchObject({
       kinds: [31237],
-      limit: 1000,
-      until: firstCreatedAt - 1000,
+      limit: 500,
+      until: firstCreatedAt - 500,
     });
 
     unmount(component);

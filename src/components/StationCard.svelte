@@ -1,25 +1,27 @@
 <script lang="ts">
-  import { resourceImage } from '@hyprgate/utils';
+  import { resourceImage, type RuntimePlayerStatus } from '@hyprgate/utils';
   import type { RadioStation } from '../lib/radio-store.js';
 
   interface Props {
     station: RadioStation;
-    isPlaying: boolean;
-    loading?: boolean;
+    selected: boolean;
+    playbackStatus: RuntimePlayerStatus | null;
     onselect: () => void;
   }
 
-  let { station, isPlaying, loading = false, onselect }: Props = $props();
+  let { station, selected, playbackStatus, onselect }: Props = $props();
+
+  let badge = $derived(playbackStatus === 'loading' ? 'TUNING' : playbackStatus === 'playing' ? 'LIVE' : playbackStatus === 'paused' ? 'PAUSED' : null);
 
   const MAX_CARD_GENRES = 3;
   let cardGenres = $derived(station.genres.slice(0, MAX_CARD_GENRES));
 </script>
 
-<div class="card group" class:active={isPlaying}>
+<div class="card group" class:active={selected}>
   <button
     class="thumb"
     onclick={onselect}
-    aria-pressed={isPlaying}
+    aria-pressed={selected}
     title={station.name}
   >
     {#if station.thumbnail}
@@ -40,7 +42,7 @@
 
     <div class="play-overlay" aria-hidden="true">
       <span class="play-glyph">
-        {#if isPlaying}
+        {#if selected && playbackStatus === 'playing'}
           <svg viewBox="0 0 24 24" focusable="false"><path d="M8 6v12" /><path d="M16 6v12" /></svg>
         {:else}
           <svg viewBox="0 0 24 24" focusable="false"><path d="M8 5.5v13l10-6.5z" /></svg>
@@ -48,10 +50,12 @@
       </span>
     </div>
 
-    {#if isPlaying}
+    {#if selected && badge}
       <div class="badge badge-live">
-        <span class="live-dot" class:is-buffering={loading}></span>
-        {loading ? 'TUNING' : 'LIVE'}
+        {#if playbackStatus !== 'paused'}
+          <span class="live-dot" class:is-buffering={playbackStatus === 'loading'}></span>
+        {/if}
+        {badge}
       </div>
     {/if}
   </button>

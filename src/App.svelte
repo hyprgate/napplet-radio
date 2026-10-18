@@ -23,7 +23,8 @@
   import type { NostrEvent } from '@hyprgate/types';
 
   const WAVEFUNC_RELAY = 'wss://relay.wavefunc.live';
-  const STATION_PAGE_LIMIT = 1000;
+  // WaveFunc rejects larger requests with CLOSED instead of returning a page.
+  const STATION_PAGE_LIMIT = 500;
 
   // Version counter pattern for store reactivity
   let version = $state(0);
@@ -475,8 +476,8 @@
         {#each visibleStations as station (station.id)}
           <StationCard
             {station}
-            isPlaying={playingId === station.id}
-            loading={playingId === station.id && playbackStatus !== 'playing'}
+            selected={playingId === station.id}
+            {playbackStatus}
             onselect={() => selectStation(station)}
           />
         {/each}
