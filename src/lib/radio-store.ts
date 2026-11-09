@@ -83,7 +83,12 @@ export function parseKind31237(event: NostrEvent): RadioStation | null {
   };
 }
 
-/** Storage key for the last-selected station ID. */
+/** Kind 31237 events are addressable: the d-tag is only unique per author. */
+export function stationKey(station: Pick<RadioStation, 'pubkey' | 'id'>): string {
+  return `${station.pubkey}:${station.id}`;
+}
+
+/** Storage key for the last-selected station. */
 const LAST_STATION_KEY = 'last-station-id';
 
 const stations = new Map<string, RadioStation>();
@@ -92,7 +97,11 @@ let loading = true;
 
 export const radioStore = {
   addStation(station: RadioStation): void {
-    stations.set(station.id, station);
+    const key = stationKey(station);
+    const existing = stations.get(key);
+    // Relays can hand back an older version of a replaced event after the new one.
+    if (existing && existing.createdAt > station.createdAt) return;
+    stations.set(key, station);
   },
   reset(): void {
     stations.clear();
@@ -102,11 +111,11 @@ export const radioStore = {
   getStations(): RadioStation[] {
     return Array.from(stations.values());
   },
-  getStation(id: string): RadioStation | undefined {
-    return stations.get(id);
+  getStation(key: string): RadioStation | undefined {
+    return stations.get(key);
   },
-  setPlaying(id: string | null): void {
-    playingId = id;
+  setPlaying(key: string | null): void {
+    playingId = key;
   },
   getPlaying(): string | null {
     return playingId;
@@ -119,12 +128,12 @@ export const radioStore = {
   },
 
   /**
-   * Persist the last-selected station ID to storage.
+   * Persist the last-selected station key to storage.
    * Fire-and-forget — no await needed for persistence.
    */
-  persistLastStation(stationId: string | null): void {
-    if (stationId) {
-      void storage.setItem(LAST_STATION_KEY, stationId).catch(() => {
+  persistLastStation(key: string | null): void {
+    if (key) {
+      void storage.setItem(LAST_STATION_KEY, key).catch(() => {
         // Ignore storage errors — persistence is best-effort
       });
     } else {
@@ -136,19 +145,18 @@ export const radioStore = {
 
   /**
    * Restore the last-selected station from storage.
-   * Returns the station ID if found in both storage and the current station map,
-   * or null if not available.
+   * Returns the station key if found in both storage and the current station map,
+   * or null if not available. Older versions saved the bare d-tag, so that still matches.
    */
   async restoreLastStation(): Promise<string | null> {
     try {
-      const savedId = await storage.getItem(LAST_STATION_KEY);
-      if (!savedId) return null;
+      const saved = await storage.getItem(LAST_STATION_KEY);
+      if (!saved) return null;
       // Only restore if the station exists in the fetched list
-      if (stations.has(savedId)) {
-        playingId = savedId;
-        return savedId;
-      }
-      return null;
+      const station = stations.get(saved) ?? [...stations.values()].find((candidate) => candidate.id === saved);
+      if (!station) return null;
+      playingId = stationKey(station);
+      return playingId;
     } catch {
       // Storage read failed — ignore, start fresh
       return null;

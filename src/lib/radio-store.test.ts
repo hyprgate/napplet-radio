@@ -28,7 +28,7 @@ vi.mock('@napplet/sdk', () => ({
   },
 }));
 
-import { parseKind31237, radioStore } from './radio-store.js';
+import { parseKind31237, stationKey, radioStore } from './radio-store.js';
 import { storage } from '@napplet/sdk';
 import type { NostrEvent } from '@hyprgate/types';
 
@@ -234,7 +234,7 @@ describe('radioStore', () => {
     const station2 = parseKind31237(updatedEvent)!;
     radioStore.addStation(station2);
 
-    const found = radioStore.getStation('station-1');
+    const found = radioStore.getStation(stationKey(station1));
     expect(found!.name).toBe('Updated Radio');
   });
 });
@@ -263,8 +263,37 @@ describe('last station persistence', () => {
     radioStore.addStation(parseKind31237(makeEvent())!);
 
     const result = await radioStore.restoreLastStation();
-    expect(result).toBe('station-1');
-    expect(radioStore.getPlaying()).toBe('station-1');
+    const key = stationKey(parseKind31237(makeEvent())!);
+    expect(result).toBe(key);
+    expect(radioStore.getPlaying()).toBe(key);
+  });
+
+  it('restoreLastStation accepts a saved station key', async () => {
+    const station = parseKind31237(makeEvent())!;
+    vi.mocked(storage.getItem).mockResolvedValue(stationKey(station));
+    radioStore.addStation(station);
+
+    expect(await radioStore.restoreLastStation()).toBe(stationKey(station));
+  });
+
+  it('keeps two people who reuse the same d-tag', () => {
+    radioStore.reset();
+    radioStore.addStation(parseKind31237(makeEvent({ pubkey: 'a'.repeat(64) }))!);
+    radioStore.addStation(parseKind31237(makeEvent({ pubkey: 'b'.repeat(64) }))!);
+
+    expect(radioStore.getStations().map((station) => station.pubkey).sort()).toEqual(['a'.repeat(64), 'b'.repeat(64)]);
+  });
+
+  it('keeps the newest version when a relay replays an older one', () => {
+    radioStore.reset();
+    const version = (createdAt: number, name: string) => parseKind31237(makeEvent({
+      created_at: createdAt,
+      tags: [['d', 'station-1'], ['name', name]],
+    }))!;
+    radioStore.addStation(version(2000, 'Newer'));
+    radioStore.addStation(version(1000, 'Older'));
+
+    expect(radioStore.getStations().map((station) => station.name)).toEqual(['Newer']);
   });
 
   it('restoreLastStation returns null when no saved station', async () => {

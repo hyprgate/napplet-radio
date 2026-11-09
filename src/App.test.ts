@@ -184,10 +184,10 @@ describe('radio app relay subscription', () => {
     eventCallback({ event: makeStationEvent() });
     eoseCallback();
     await vi.waitFor(() => {
-      expect(document.body.textContent).toContain('No more stations found');
+      expect(document.body.textContent).toContain("That's all the stations we found");
     });
 
-    expect(document.body.textContent).toContain('No more stations found');
+    expect(document.body.textContent).toContain("That's all the stations we found");
     expect(document.querySelector('.load-more-button')).toBeNull();
 
     unmount(component);
@@ -292,7 +292,7 @@ describe('radio app relay subscription', () => {
     eoseCallback();
 
     await vi.waitFor(() => {
-      expect(document.body.textContent).toContain('No stations found');
+      expect(document.body.textContent).toContain('No stations yet');
     });
     expect(document.querySelector<HTMLButtonElement>('button[title="Broken Cover Radio"]')).toBeNull();
     expect(document.querySelector('[data-radio-root]')?.getAttribute('data-radio-count')).toBe('0');
@@ -317,10 +317,96 @@ describe('radio app relay subscription', () => {
     eoseCallback();
 
     await vi.waitFor(() => {
-      expect(document.body.textContent).toContain('No stations found');
+      expect(document.body.textContent).toContain('No stations yet');
     });
     expect(document.querySelector<HTMLButtonElement>('button[title="Missing Cover Radio"]')).toBeNull();
     expect(coverImageMock.coverImageResolves).toHaveBeenCalledWith(null);
+
+    unmount(component);
+  });
+
+  async function mountWithStation(): Promise<{ component: ReturnType<typeof mount>; card: HTMLButtonElement }> {
+    const component = mount(App, { target: document.body });
+    await waitForInitialSubscription();
+    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (result: RelayEventResult) => void;
+    eventCallback({ event: makeStationEvent() });
+    await vi.waitFor(() => expect(document.querySelector('button[title="Phase 94 Radio"]')).not.toBeNull());
+    return { component, card: document.querySelector<HTMLButtonElement>('button[title="Phase 94 Radio"]')! };
+  }
+
+  it('shows the station description on the card', async () => {
+    const { component } = await mountWithStation();
+
+    expect(document.querySelector('.description')?.textContent).toBe('Phase 94 station');
+
+    unmount(component);
+  });
+
+  it('names what is playing, and says so when it never starts', async () => {
+    vi.mocked(requestRuntimePlayback).mockResolvedValueOnce({ sessionId: 'radio-session' });
+    const { component, card } = await mountWithStation();
+    card.click();
+    await vi.waitFor(() => expect(subscribeRuntimePlayback).toHaveBeenCalled());
+    await vi.waitFor(() => expect(document.querySelector('[data-radio-now-playing]')?.textContent).toContain('Tuning in to'));
+    const onState = vi.mocked(subscribeRuntimePlayback).mock.calls[0]![1];
+
+    onState({ sessionId: 'radio-session', windowId: '', state: 'idle', position: 0, duration: null, volume: 1, muted: false });
+    await vi.waitFor(() => expect(document.querySelector('[data-radio-now-playing]')?.textContent).toContain("Couldn't play Phase 94 Radio"));
+    expect(card.querySelector('.badge-failed')?.textContent).toBe("Can't play");
+    expect(card.getAttribute('aria-pressed')).toBe('false');
+
+    unmount(component);
+  });
+
+  it('does not call stopping a playing station a failure', async () => {
+    const { component, card } = await mountWithStation();
+    card.click();
+    await vi.waitFor(() => expect(subscribeRuntimePlayback).toHaveBeenCalled());
+    const onState = vi.mocked(subscribeRuntimePlayback).mock.calls[0]![1];
+    const runtime = { sessionId: 'radio-session', windowId: '', position: 0, duration: null, volume: 1, muted: false };
+
+    onState({ ...runtime, state: 'playing' });
+    await tick();
+    onState({ ...runtime, state: 'idle' });
+    await vi.waitFor(() => expect(document.querySelector('[data-radio-now-playing]')).toBeNull());
+    expect(card.querySelector('.badge-failed')).toBeNull();
+
+    unmount(component);
+  });
+
+  it('keeps long genre lists short until asked, and keeps the active one in view', async () => {
+    const component = mount(App, { target: document.body });
+    await waitForInitialSubscription();
+    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (result: RelayEventResult) => void;
+    const names = Array.from({ length: 12 }, (_, index) => `genre-${index}`);
+    eventCallback({ event: makeStationEvent({ tags: [['d', 'many'], ['name', 'Many'], ['thumbnail', 'https://cover.example.test/m.png'], ...names.map((name) => ['t', name])] }) });
+    await vi.waitFor(() => expect(document.querySelector('.genre-more')).not.toBeNull());
+
+    const pills = () => [...document.querySelectorAll('.genre-pill')].map((pill) => pill.textContent);
+    expect(pills()).toHaveLength(9);
+    expect(document.querySelector('.genre-more')?.textContent).toBe('4 more');
+
+    document.querySelector<HTMLButtonElement>('.genre-more')!.click();
+    await tick();
+    expect(pills()).toHaveLength(13);
+
+    [...document.querySelectorAll<HTMLButtonElement>('.genre-pill')].find((pill) => pill.textContent === 'genre-11')!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>('.genre-more')!.click();
+    await tick();
+    expect(pills()).toContain('genre-11');
+
+    unmount(component);
+  });
+
+  it('holds places for stations still waiting on a cover check', async () => {
+    coverImageMock.state.autoResolve = false;
+    const component = mount(App, { target: document.body });
+    await waitForInitialSubscription();
+    const eventCallback = vi.mocked(relay.subscribe).mock.calls[0]![1] as (result: RelayEventResult) => void;
+    eventCallback({ event: makeStationEvent() });
+    await vi.waitFor(() => expect(document.querySelector('[data-radio-skeleton]')).not.toBeNull());
+    expect(document.querySelector('button[title="Phase 94 Radio"]')).toBeNull();
 
     unmount(component);
   });

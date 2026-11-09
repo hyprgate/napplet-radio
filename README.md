@@ -4,32 +4,14 @@
 > Do not push commits to this standalone napplet repository; direct changes are overwritten by Hyprgate's mirror workflow.
 <!-- HYPRGATE NAPPLET MIRROR NOTICE:END -->
 
-# napplet-radio
+# Radio
 
-[![CI](https://github.com/hyprgate/napplet-radio/actions/workflows/ci.yml/badge.svg)](https://github.com/hyprgate/napplet-radio/actions/workflows/ci.yml)
+Internet radio stations from kind 31237 events, with genre filters and playback through the
+shell's player.
 
-Forkable source repository for the Hyprgate built-in napplet currently packaged as `@hyprgate/napp-radio`.
-
-This repository was split from `hyprgate/gui` and is mounted back into the parent checkout as `napplets/radio`.
-It still expects the parent workspace when built through Hyprgate because shared `@hyprgate/*` packages remain workspace dependencies.
-
-## Parent checkout
-
-```bash
-git clone --recurse-submodules git@github.com:hyprgate/gui.git
-cd gui
-pnpm install --frozen-lockfile
-pnpm --filter @hyprgate/napp-radio build
-```
-
-## Paja runtime
-
-```bash
-pnpm --filter @hyprgate/napp-radio paja
-```
-
-This starts Kehto Paja and the napplet's Vite dev server together, using
-the port configured in `vite.config.ts`.
+Package: `@hyprgate/napp-radio`. Source lives in the Hyprgate monorepo at `napplets/radio`. The
+standalone `hyprgate/napplet-radio` repository is a generated, read-only mirror, so send changes
+to `hyprgate/web`.
 
 ## Runtime playback lifecycle
 
@@ -52,19 +34,18 @@ When changing Radio during shell development, rebuild the app and restart the
 shell dev server. The local relay/Blossom harness publishes the built package at
 server startup; rebuilding alone does not replace its in-memory package.
 
-## Testing
+A station is only listed once its cover image has proven loadable, so stations with no cover or
+a broken one stay out of counts, filters and the playback queue. The grid holds placeholders
+while those checks run.
 
-Run these checks from a Hyprgate parent checkout so workspace dependencies resolve:
+## Working on it
+
+Run these from the Hyprgate checkout so `workspace:*` packages resolve:
 
 ```bash
-git clone --recurse-submodules git@github.com:hyprgate/gui.git
-cd gui
 pnpm install --frozen-lockfile
-pnpm --filter @hyprgate/napp-radio conformance
-pnpm --filter @hyprgate/napp-radio test
-pnpm --filter @hyprgate/napp-radio build
+pnpm --filter ./napplets/radio paja        # Kehto Paja plus the Vite dev server
+pnpm --filter ./napplets/radio exec vitest run
+pnpm --filter ./napplets/radio type-check
+pnpm --filter ./napplets/radio conformance # builds, then checks dist/
 ```
-
-The `conformance` script builds the napplet and runs `@napplet/conformance-cli` against `dist/`. CI runs the same conformance, unit test, and build checks for every push and pull request.
-
-CI runs from the standalone napplet repository but checks out `hyprgate/gui` to resolve private `workspace:*` packages. Configure `HYPRGATE_GUI_CHECKOUT_TOKEN` with read access to `hyprgate/gui` before enabling GitHub Actions.

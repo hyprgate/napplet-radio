@@ -5,11 +5,12 @@
   interface Props {
     station: RadioStation;
     selected: boolean;
+    failed?: boolean;
     playbackStatus: RuntimePlayerStatus | null;
     onselect: () => void;
   }
 
-  let { station, selected, playbackStatus, onselect }: Props = $props();
+  let { station, selected, failed = false, playbackStatus, onselect }: Props = $props();
 
   let badge = $derived(playbackStatus === 'loading' ? 'TUNING' : playbackStatus === 'playing' ? 'LIVE' : playbackStatus === 'paused' ? 'PAUSED' : null);
 
@@ -17,17 +18,18 @@
   let cardGenres = $derived(station.genres.slice(0, MAX_CARD_GENRES));
 </script>
 
-<div class="card group" class:active={selected}>
+<div class="card group" class:active={selected} class:failed>
   <button
     class="thumb"
     onclick={onselect}
     aria-pressed={selected}
+    aria-label={selected ? station.name : `Play ${station.name}`}
     title={station.name}
   >
     {#if station.thumbnail}
       <img
         use:resourceImage={station.thumbnail}
-        alt={station.name}
+        alt=""
         class="w-full h-full object-cover"
       />
     {:else}
@@ -57,11 +59,16 @@
         {/if}
         {badge}
       </div>
+    {:else if failed}
+      <div class="badge badge-failed">Can't play</div>
     {/if}
   </button>
 
   <div class="info">
     <div class="name" title={station.name}>{station.name}</div>
+    {#if station.description}
+      <p class="description" title={station.description}>{station.description}</p>
+    {/if}
     {#if cardGenres.length > 0}
       <div class="genres">
         {#each cardGenres as genre (genre)}
@@ -106,6 +113,27 @@
     box-shadow:
       inset 0 0 0 2px var(--hg-accent-primary, #5d5dff),
       0 0 24px color-mix(in srgb, var(--hg-accent-primary, #5d5dff) 26%, transparent);
+  }
+
+  .card.failed .thumb {
+    border-color: var(--hg-accent-danger, #ff5d5d);
+  }
+
+  .thumb:focus-visible {
+    outline: 2px solid var(--hg-accent-primary, #5d5dff);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .thumb,
+    .thumb:hover {
+      transform: none;
+      transition: none;
+    }
+
+    .live-dot {
+      animation: none;
+    }
   }
 
   .thumb-fallback {
@@ -191,6 +219,11 @@
     backdrop-filter: blur(4px);
   }
 
+  .badge-failed {
+    color: var(--hg-accent-danger, #ff5d5d);
+    background: color-mix(in srgb, var(--hg-bg-base, #050505) 82%, transparent);
+  }
+
   .live-dot {
     width: 7px;
     height: 7px;
@@ -218,15 +251,29 @@
   .name {
     font-size: 13px;
     font-weight: 600;
+    line-height: 1.3;
     color: var(--hg-text-primary, #f2efe7);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
+  .description {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    margin: 4px 0 0;
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--hg-text-muted, #b8b1a4);
+  }
+
+  /* Wrapped and capped to one row, so a chip is either whole or absent. */
   .genres {
     display: flex;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     gap: 4px;
     margin-top: 6px;
     overflow: hidden;
