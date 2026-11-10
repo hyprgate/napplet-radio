@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';
 import App from './App.svelte';
-import { inc, relay, storage } from '@napplet/sdk';
+import { inc, intent, relay, storage } from '@napplet/sdk';
 import { requestRuntimePlayback, subscribeRuntimePlayback } from '@hyprgate/utils';
 import type { NostrEvent } from '@hyprgate/types';
 
@@ -32,6 +32,9 @@ vi.mock('@napplet/sdk', () => ({
   inc: {
     emit: vi.fn(),
     on: vi.fn().mockReturnValue({ close: vi.fn() }),
+  },
+  intent: {
+    onDelivery: vi.fn().mockReturnValue({ close: vi.fn() }),
   },
   storage: {
     getItem: vi.fn().mockResolvedValue(null),
@@ -409,5 +412,364 @@ describe('radio app relay subscription', () => {
     expect(document.querySelector('button[title="Phase 94 Radio"]')).toBeNull();
 
     unmount(component);
+  });
+
+  describe('napplet:radio/play', () => {
+    type Delivery = Parameters<Parameters<typeof intent.onDelivery>[0]>[0];
+
+    function stationEvent(id: string, name: string, genres: string[], createdAt = 1700000000): NostrEvent {
+      return makeStationEvent({
+        id: `event-${id}`,
+        created_at: createdAt,
+        tags: [
+          ['d', id], ['name', name], ['thumbnail', `https://cover.example.test/${id}.png`],
+          ...genres.map((genre) => ['t', genre]),
+        ],
+      });
+    }
+
+    function pageCallbacks(call: number): { onEvent: (result: RelayEventResult) => void; onEose: () => void } {
+      const args = vi.mocked(relay.subscribe).mock.calls[call]!;
+      return { onEvent: args[1] as (result: RelayEventResult) => void, onEose: args[2] as () => void };
+    }
+
+    function deliver(payload: unknown): void {
+      const onDelivery = vi.mocked(intent.onDelivery).mock.calls.at(-1)![0];
+      onDelivery({ sender: 'shell', archetype: 'radio', action: 'play', convention: 'napplet:radio/play', payload } as Delivery);
+    }
+
+    it('plays the station matching a query that arrives before the stations do, instead of the last one played', async () => {
+      // Restoring is skipped, so a queued once-value would leak into the next test.
+      vi.mocked(storage.getItem).mockResolvedValue('jazz-24');
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      deliver({ query: 'synthwave' });
+      await tick();
+      expect(document.querySelector('[data-radio-play-notice]')?.getAttribute('data-radio-play-notice')).toBe('searching');
+      expect(document.body.textContent).toContain('Looking for a station matching “synthwave”');
+      expect(requestRuntimePlayback).not.toHaveBeenCalled();
+      // The lookup is already out; the first page answers sooner here.
+      expect(relay.subscribe).toHaveBeenCalledTimes(2);
+
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave']) });
+      onEose();
+
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Nightride FM', autoplay: true });
+      expect(storage.getItem).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Nightride FM"]')?.getAttribute('aria-pressed')).toBe('true'));
+      expect(document.querySelector('button[title="Jazz 24"]')?.getAttribute('aria-pressed')).toBe('false');
+      expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+      expect(storage.setItem).toHaveBeenCalledWith('last-station-id', 'station-host:nightride-fm');
+      vi.mocked(storage.getItem).mockResolvedValue(null);
+      await unmount(component);
+    });
+
+    it('plays a loaded station at once, by id, and shows it when a genre filter hid it', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+      const jazzPill = [...document.querySelectorAll<HTMLButtonElement>('.genre-pill')].find((pill) => pill.textContent === 'jazz')!;
+      jazzPill.click();
+      await tick();
+      expect(document.querySelector('button[title="Nightride FM"]')).toBeNull();
+
+      deliver({ station: 'nightride-fm' });
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Nightride FM' });
+      await vi.waitFor(() => expect(document.querySelector('button[title="Nightride FM"]')?.getAttribute('aria-pressed')).toBe('true'));
+      await unmount(component);
+    });
+
+    it('looks an unloaded station up on the relay by genre instead of paging for it', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+
+      deliver({ query: 'synthwave' });
+      await tick();
+      expect(relay.subscribe).toHaveBeenCalledTimes(2);
+      const lookupCall = vi.mocked(relay.subscribe).mock.calls[1]!;
+      expect(lookupCall[0]).toEqual([
+        { kinds: [31237], '#c': ['synthwave'], limit: 500 },
+        { kinds: [31237], '#t': ['synthwave'], limit: 500 },
+      ]);
+      expect(lookupCall[3]).toEqual({ relay: 'wss://relay.wavefunc.live' });
+      expect(document.querySelector('[data-radio-play-notice]')?.getAttribute('data-radio-play-notice')).toBe('searching');
+      expect(requestRuntimePlayback).not.toHaveBeenCalled();
+
+      const lookup = pageCallbacks(1);
+      lookup.onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave'], 1600000000) });
+      lookup.onEose();
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Nightride FM' });
+      await vi.waitFor(() => expect(document.querySelector('button[title="Nightride FM"]')?.getAttribute('aria-pressed')).toBe('true'));
+      expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+      // One lookup, no further pages.
+      expect(relay.subscribe).toHaveBeenCalledTimes(2);
+      await unmount(component);
+    });
+
+    it('says so when the lookup finds nothing, and leaves what was playing alone', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+      document.querySelector<HTMLButtonElement>('button[title="Jazz 24"]')!.click();
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+
+      deliver({ query: 'synthwave' });
+      await tick();
+      expect(document.querySelector('[data-radio-play-notice]')?.getAttribute('data-radio-play-notice')).toBe('searching');
+      pageCallbacks(1).onEose();
+      await vi.waitFor(() => expect(document.querySelector('[data-radio-play-notice]')?.getAttribute('data-radio-play-notice')).toBe('not-found'));
+      const notice = document.querySelector('[data-radio-play-notice]')!;
+      expect(notice.textContent).toContain('No station matches “synthwave”.');
+      expect(relay.subscribe).toHaveBeenCalledTimes(2);
+      expect(requestRuntimePlayback).toHaveBeenCalledTimes(1);
+      expect(document.querySelector('button[title="Jazz 24"]')?.getAttribute('aria-pressed')).toBe('true');
+
+      notice.querySelector<HTMLButtonElement>('button')!.click();
+      await tick();
+      expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+
+      // A payload Radio cannot use is ignored: no notice, no lookup.
+      deliver({ volume: 11 });
+      await tick();
+      expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+      expect(relay.subscribe).toHaveBeenCalledTimes(2);
+      await unmount(component);
+    });
+
+    it('plays a looked-up station without waiting for cover images', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+
+      // Covers are slowest right after Radio opens; from here none of them answers.
+      coverImageMock.state.autoResolve = false;
+      coverImageMock.coverImageResolves.mockClear();
+      deliver({ query: 'synthwave' });
+      await tick();
+      const lookup = pageCallbacks(1);
+      for (let index = 0; index < 6; index++) {
+        lookup.onEvent({ event: stationEvent(`broad-${index}`, `Broad ${index}`, ['pop', 'rock', 'synthwave'], 1600000010 + index) });
+      }
+      lookup.onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave'], 1600000000) });
+      lookup.onEose();
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Nightride FM' });
+      expect(coverImageMock.coverImageResolves).not.toHaveBeenCalled();
+      // The station playing and its two fallbacks join the grid; the rest of the results do not.
+      await vi.waitFor(() => expect(document.querySelector('button[title="Nightride FM"]')?.getAttribute('aria-pressed')).toBe('true'));
+      expect(document.querySelector('[data-radio-root]')?.getAttribute('data-radio-count')).toBe('4');
+      expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+      await unmount(component);
+    });
+
+    it('plays shortly after the relay\'s matches arrive, without waiting to be told they have ended', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+      deliver({ query: 'synthwave' });
+      await tick();
+      const lookup = pageCallbacks(1);
+      lookup.onEvent({ event: stationEvent('everything-fm', 'Everything FM', ['pop', 'rock', 'synthwave'], 1600000002) });
+      lookup.onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave'], 1600000001) });
+      expect(requestRuntimePlayback).not.toHaveBeenCalled();
+      // No end-of-stored-events from the shell: the best of what arrived plays after the settle time.
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1), { timeout: 4_000 });
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Nightride FM' });
+      await unmount(component);
+    });
+
+    it('moves to the next match when the stream fails or never starts, and says so when none plays', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+
+      deliver({ query: 'synthwave' });
+      await tick();
+      const lookup = pageCallbacks(1);
+      // The broad station arrives first; the focused one ranks above it.
+      lookup.onEvent({ event: stationEvent('everything-fm', 'Everything FM', ['pop', 'rock', 'jazz', 'synthwave'], 1600000002) });
+      lookup.onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave'], 1600000001) });
+      lookup.onEose();
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Nightride FM' });
+      expect(relay.subscribe).toHaveBeenCalledTimes(2);
+
+      // The shell player reports the stream dead: the next match is tried, with no new lookup.
+      const runtimeState = { sessionId: 'radio-session', windowId: '', position: 0, duration: null, volume: 0.7, muted: false };
+      await vi.waitFor(() => expect(subscribeRuntimePlayback).toHaveBeenCalledTimes(1));
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        vi.mocked(subscribeRuntimePlayback).mock.calls[0]![1]({ ...runtimeState, state: 'error' });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(requestRuntimePlayback).toHaveBeenCalledTimes(2);
+        expect(vi.mocked(requestRuntimePlayback).mock.calls[1]![0]).toMatchObject({ title: 'Everything FM' });
+        expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+
+        // That one never reaches playing. After ten seconds there is nothing left to try.
+        vi.mocked(subscribeRuntimePlayback).mock.calls[1]![1]({ ...runtimeState, state: 'loading' });
+        await vi.advanceTimersByTimeAsync(9_999);
+        expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+        await vi.advanceTimersByTimeAsync(1);
+        await tick();
+        const notice = document.querySelector('[data-radio-play-notice]')!;
+        expect(notice.getAttribute('data-radio-play-notice')).toBe('failed');
+        expect(notice.textContent).toContain('Stations matching “synthwave” were found, but none would play.');
+        expect(requestRuntimePlayback).toHaveBeenCalledTimes(2);
+        expect(relay.subscribe).toHaveBeenCalledTimes(2);
+        expect(document.querySelector('button[title="Everything FM"]')?.getAttribute('aria-pressed')).toBe('false');
+      } finally {
+        vi.useRealTimers();
+      }
+      await unmount(component);
+    });
+
+    it('stops trying other stations once the requested one plays', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave']) });
+      onEvent({ event: stationEvent('everything-fm', 'Everything FM', ['pop', 'synthwave']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Nightride FM"]')).not.toBeNull());
+      deliver({ query: 'synthwave' });
+      await vi.waitFor(() => expect(subscribeRuntimePlayback).toHaveBeenCalledTimes(1));
+      // A strong match was already loaded, so nothing was looked up.
+      expect(relay.subscribe).toHaveBeenCalledTimes(1);
+      const onState = vi.mocked(subscribeRuntimePlayback).mock.calls[0]![1];
+      const runtimeState = { sessionId: 'radio-session', windowId: '', position: 0, duration: null, volume: 0.7, muted: false };
+      onState({ ...runtimeState, state: 'playing' });
+      // A later error is an ordinary stop, not a reason to switch stations.
+      onState({ ...runtimeState, state: 'error' });
+      await tick();
+      expect(requestRuntimePlayback).toHaveBeenCalledTimes(1);
+      expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+      await unmount(component);
+    });
+
+    it('gives up after twenty seconds when the relay never answers', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        deliver({ query: 'synthwave' });
+        await tick();
+        await vi.advanceTimersByTimeAsync(19_999);
+        await tick();
+        expect(document.querySelector('[data-radio-play-notice]')?.getAttribute('data-radio-play-notice')).toBe('searching');
+        await vi.advanceTimersByTimeAsync(1);
+        await tick();
+        const notice = document.querySelector('[data-radio-play-notice]')!;
+        expect(notice.getAttribute('data-radio-play-notice')).toBe('not-found');
+        expect(notice.textContent).toContain('No station matches “synthwave”.');
+        // A station that turns up after the deadline is not played.
+        const lookup = pageCallbacks(1);
+        lookup.onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave'], 1600000000) });
+        lookup.onEose();
+        await vi.advanceTimersByTimeAsync(100);
+        expect(requestRuntimePlayback).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+      await unmount(component);
+    });
+
+    it('searches for the telling word of a guessed station name and says what it is looking for', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+
+      deliver({ station: 'synthwave.radio' });
+      await tick();
+      expect(document.querySelector('[data-radio-play-notice]')?.textContent).toContain('Looking for a station matching “synthwave”');
+      expect(vi.mocked(relay.subscribe).mock.calls[1]![0]).toEqual([
+        { kinds: [31237], '#d': ['synthwave.radio'] },
+        { kinds: [31237], '#c': ['synthwave'], limit: 500 },
+        { kinds: [31237], '#t': ['synthwave'], limit: 500 },
+      ]);
+      const lookup = pageCallbacks(1);
+      lookup.onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave'], 1600000000) });
+      lookup.onEose();
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Nightride FM' });
+      await unmount(component);
+    });
+
+    it('waits for the first page before saying nothing matches', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      deliver({ query: 'nightride' });
+      await tick();
+      // The genre lookup comes back empty while the first page is still loading.
+      pageCallbacks(1).onEose();
+      await tick();
+      await tick();
+      expect(document.querySelector('[data-radio-play-notice]')?.getAttribute('data-radio-play-notice')).toBe('searching');
+
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave']) });
+      onEose();
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Nightride FM' });
+      expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+      await unmount(component);
+    });
+
+    it('drops a pending request when the user picks a station by hand', async () => {
+      const component = mount(App, { target: document.body });
+      await waitForInitialSubscription();
+      const { onEvent, onEose } = pageCallbacks(0);
+      onEvent({ event: stationEvent('jazz-24', 'Jazz 24', ['jazz']) });
+      onEose();
+      await vi.waitFor(() => expect(document.querySelector('button[title="Jazz 24"]')).not.toBeNull());
+      deliver({ query: 'synthwave' });
+      await tick();
+      expect(relay.subscribe).toHaveBeenCalledTimes(2);
+
+      document.querySelector<HTMLButtonElement>('button[title="Jazz 24"]')!.click();
+      await vi.waitFor(() => expect(requestRuntimePlayback).toHaveBeenCalledTimes(1));
+      expect(document.querySelector('[data-radio-play-notice]')).toBeNull();
+      const lookup = pageCallbacks(1);
+      lookup.onEvent({ event: stationEvent('nightride-fm', 'Nightride FM', ['synthwave'], 1600000000) });
+      lookup.onEose();
+      await tick();
+      await tick();
+      expect(requestRuntimePlayback).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(requestRuntimePlayback).mock.calls[0]![0]).toMatchObject({ title: 'Jazz 24' });
+      expect(document.querySelector('button[title="Nightride FM"]')).toBeNull();
+      await unmount(component);
+    });
   });
 });

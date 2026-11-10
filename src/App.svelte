@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
-  import { relay, inc } from '@napplet/sdk';
+  import { onMount, onDestroy, tick } from 'svelte';
+  import { relay, inc, intent } from '@napplet/sdk';
   import {
     createStreamChannelSwitchPayload,
     createStreamCurrentContextPayload,
@@ -17,6 +17,15 @@
   import { radioStore, parseKind31237, stationKey } from './lib/radio-store.js';
   import { coverImageResolves } from './lib/radio-cover-image.js';
   import { getNextRadioPageRequest } from './lib/radio-pagination.js';
+  import {
+    rankStationMatches,
+    radioLookupFilters,
+    STRONG_MATCH_SCORE,
+    radioPlayRequestFromDelivery,
+    radioPlayRequestLabel,
+    type RadioIntentDelivery,
+    type RadioPlayRequest,
+  } from './lib/radio-intent.js';
   import StationCard from './components/StationCard.svelte';
   import type { RadioStation } from './lib/radio-store.js';
   import type { Subscription } from '@napplet/sdk';
@@ -25,6 +34,14 @@
   const WAVEFUNC_RELAY = 'wss://relay.wavefunc.live';
   // WaveFunc rejects larger requests with CLOSED instead of returning a page.
   const STATION_PAGE_LIMIT = 500;
+  // A request to play a station ends within this long, found or not. It covers
+  // the relay service's own 15 s wait for a relay that never answers.
+  const PLAY_REQUEST_DEADLINE_MS = 20_000;
+  // After the first looked-up station arrives, how long the rest of the relay's answer gets.
+  const LOOKUP_SETTLE_MS = 1_500;
+  // A requested station that is not playing by then counts as failed, and the next match is tried.
+  const STREAM_START_TIMEOUT_MS = 10_000;
+  const MAX_PLAY_ATTEMPTS = 3;
 
   // Version counter pattern for store reactivity
   let version = $state(0);
@@ -39,6 +56,12 @@
   });
   let playbackStatus = $state<RuntimePlayerStatus | null>(null);
   let activeGenre = $state<string | null>(null);
+  // A `napplet:radio/play` request that has not found its station yet, and what
+  // the user is told about it.
+  let pendingPlay: RadioPlayRequest | null = null;
+  let playNotice = $state<{ state: 'searching' | 'not-found' | 'failed'; label: string } | null>(null);
+  // The station started for a request, with the next matches to try if its stream fails.
+  let playAttempt: { label: string; remaining: RadioStation[]; timer: ReturnType<typeof setTimeout> | null } | null = null;
   let failedStationKey = $state<string | null>(null);
   let showAllGenres = $state(false);
   const GENRE_PREVIEW_COUNT = 8;
@@ -74,6 +97,12 @@
 
   let sub: Subscription | null = null;
   let contextSub: { close(): void } | null = null;
+  let deliverySub: { close(): void } | null = null;
+  let lookupSub: { close(): void } | null = null;
+  let lookupId = 0;
+  let lookedUp: RadioPlayRequest | null = null;
+  let playDeadline: ReturnType<typeof setTimeout> | null = null;
+  let lookupSettle: ReturnType<typeof setTimeout> | null = null;
   let runtimeSubscription: RuntimePlayerSubscription | null = null;
   let pollInterval: ReturnType<typeof setInterval> | null = null;
   let scrollContainer: HTMLDivElement | undefined = $state();
@@ -187,6 +216,14 @@
     clearRuntimeSubscription();
     runtimeSubscription = subscribeRuntimePlayback(sessionId, (state) => {
       if (destroyed || token !== playbackRequestToken) return;
+      if (playAttempt) {
+        // The shell player reports how the requested station's stream fared.
+        if (state?.state === 'playing' || state?.state === 'paused') stopPlayAttempt();
+        else if (state?.state !== 'loading') {
+          tryNextMatch();
+          return;
+        }
+      }
       if (!state || state.state === 'idle' || state.state === 'ended' || state.state === 'error') {
         // The player drops back to idle when a source never loads, rather than erroring.
         const failed = state?.state === 'error' || (playbackStatus === 'loading' && state?.state === 'idle');
@@ -242,6 +279,11 @@
       failedStationKey = stationKey(station);
       radioStore.setPlaying(null);
       console.warn('[radio] player.requestPlayback failed', error);
+      if (playAttempt) {
+        notifyUpdate();
+        tryNextMatch();
+        return false;
+      }
     }
     notifyUpdate();
     return true;
@@ -278,6 +320,168 @@
     emitChannelSwitch(station, streamUrl);
   }
 
+  function stopPlayAttempt(): void {
+    if (playAttempt?.timer) clearTimeout(playAttempt.timer);
+    playAttempt = null;
+  }
+
+  function clearPlayRequest(): void {
+    closeLookup();
+    stopPlayAttempt();
+    if (playDeadline) clearTimeout(playDeadline);
+    playDeadline = null;
+    pendingPlay = null;
+    playNotice = null;
+  }
+
+  function reportNoMatch(request: RadioPlayRequest): void {
+    clearPlayRequest();
+    playNotice = { state: 'not-found', label: radioPlayRequestLabel(request) };
+  }
+
+  /** A click on a card is the user's own choice; it ends any pending request. */
+  function selectStationByHand(station: RadioStation): void {
+    clearPlayRequest();
+    void selectStation(station);
+  }
+
+  async function revealPlayingStation(): Promise<void> {
+    await tick();
+    const card = scrollContainer?.querySelector('.card.active');
+    if (card && typeof card.scrollIntoView === 'function') card.scrollIntoView({ block: 'center' });
+  }
+
+  function closeLookup(): void {
+    lookupSub?.close();
+    lookupSub = null;
+    if (lookupSettle) clearTimeout(lookupSettle);
+    lookupSettle = null;
+    lookupId++;
+  }
+
+  /**
+   * Start the best match and keep the next ones in reserve: a listed station's
+   * stream can be dead, and the shell player says so only once it has tried.
+   */
+  function playMatches(request: RadioPlayRequest, matches: RadioStation[]): void {
+    clearPlayRequest();
+    playAttempt = { label: radioPlayRequestLabel(request), remaining: matches.slice(1, MAX_PLAY_ATTEMPTS), timer: null };
+    startAttempt(matches[0]!);
+  }
+
+  function startAttempt(station: RadioStation): void {
+    const attempt = playAttempt;
+    if (!attempt) return;
+    if (attempt.timer) clearTimeout(attempt.timer);
+    attempt.timer = setTimeout(() => {
+      if (playAttempt === attempt) tryNextMatch();
+    }, STREAM_START_TIMEOUT_MS);
+    if (activeGenre && !station.genres.includes(activeGenre)) activeGenre = null;
+    void selectStation(station);
+    void revealPlayingStation();
+  }
+
+  /** The station picked for a request failed or never started: move to the next match, or say none would play. */
+  function tryNextMatch(): void {
+    const attempt = playAttempt;
+    if (!attempt || destroyed) return;
+    const next = attempt.remaining.shift();
+    if (next) {
+      startAttempt(next);
+      return;
+    }
+    stopPlayAttempt();
+    playbackRequestToken++;
+    void releaseRuntimeSession();
+    playbackStatus = null;
+    radioStore.setPlaying(null);
+    radioStore.persistLastStation(null);
+    playNotice = { state: 'failed', label: attempt.label };
+    notifyUpdate();
+  }
+
+  /**
+   * Ask the relay for the stations a request names instead of paging the whole
+   * catalog for them: WaveFunc holds tens of thousands of stations and
+   * rate-limits a client that walks them.
+   *
+   * These stations are not held back for their cover images the way a page of
+   * stations is. Covers are slowest just after Radio opens, which is when an
+   * agent's request arrives, and a requested station should play regardless.
+   * Only the few that will be tried join the grid.
+   */
+  function startLookup(request: RadioPlayRequest): void {
+    closeLookup();
+    const id = lookupId;
+    const found = new Map<string, RadioStation>();
+    const pick = (ended: boolean): void => {
+      if (destroyed || id !== lookupId || pendingPlay !== request) return;
+      const candidates = [...radioStore.getStations(), ...[...found.values()].filter((station) => !radioStore.getStation(stationKey(station)))];
+      const best = rankStationMatches(candidates, request).slice(0, MAX_PLAY_ATTEMPTS).map((match) => match.station);
+      if (best.length > 0) {
+        for (const station of best) if (!radioStore.getStation(stationKey(station))) radioStore.addStation(station);
+        playMatches(request, best);
+        return;
+      }
+      if (!ended) return;
+      closeLookup();
+      lookedUp = request;
+      resolvePendingPlay();
+    };
+    lookupSub = relay.subscribe(
+      radioLookupFilters(request, STATION_PAGE_LIMIT),
+      (result) => {
+        if (id !== lookupId) return;
+        const station = parseKind31237(result.event as NostrEvent);
+        if (!station || found.has(stationKey(station))) return;
+        found.set(stationKey(station), station);
+        // The relay sends its matches in a burst, but the shell reports the end
+        // of them only after its own cache has answered, which takes seconds
+        // while a station page is being stored. Pick shortly after the first.
+        lookupSettle ??= setTimeout(() => pick(false), LOOKUP_SETTLE_MS);
+      },
+      () => pick(true),
+      { relay: WAVEFUNC_RELAY },
+    );
+  }
+
+  /**
+   * Play the pending request's station when a good match is already loaded;
+   * otherwise look it up on the relay. Runs on delivery and again when the
+   * first page arrives.
+   */
+  function resolvePendingPlay(): void {
+    const request = pendingPlay;
+    if (!request || destroyed) return;
+    const matches = rankStationMatches(radioStore.getStations(), request);
+    const lookupDone = lookedUp === request;
+    if (matches.length > 0 && (lookupDone || matches[0]!.score >= STRONG_MATCH_SCORE)) {
+      playMatches(request, matches.map((match) => match.station));
+      return;
+    }
+    if (!lookupDone) {
+      if (!lookupSub) startLookup(request);
+      return;
+    }
+    // The lookup found nothing. The first page may still hold a station whose
+    // name matches, so the answer waits for it.
+    if (radioStore.isLoading() || coverChecksPending > 0) return;
+    reportNoMatch(request);
+  }
+
+  function handleIntentDelivery(delivery: RadioIntentDelivery): void {
+    const request = radioPlayRequestFromDelivery(delivery);
+    if (!request || destroyed) return;
+    clearPlayRequest();
+    lookedUp = null;
+    pendingPlay = request;
+    playNotice = { state: 'searching', label: radioPlayRequestLabel(request) };
+    playDeadline = setTimeout(() => {
+      if (pendingPlay === request && !destroyed) reportNoMatch(request);
+    }, PLAY_REQUEST_DEADLINE_MS);
+    resolvePendingPlay();
+  }
+
   function closePageSubscription(): void {
     sub?.close();
     sub = null;
@@ -307,6 +511,8 @@
   async function restoreLastStationOnce(): Promise<void> {
     if (restoredLastStation) return;
     restoredLastStation = true;
+    // A station someone just asked for wins over the one played last time.
+    if (pendingPlay) return;
     const restoredId = await radioStore.restoreLastStation();
     if (!restoredId) return;
     const station = radioStore.getStation(restoredId);
@@ -369,6 +575,7 @@
           await restoreLastStationOnce();
           notifyUpdate();
         }
+        resolvePendingPlay();
       },
       { relay: WAVEFUNC_RELAY },
     );
@@ -430,6 +637,8 @@
       ));
     });
 
+    deliverySub = intent.onDelivery(handleIntentDelivery);
+
     pollInterval = setInterval(notifyUpdate, 500);
   });
 
@@ -438,6 +647,8 @@
     playbackRequestToken++;
     closePageSubscription();
     contextSub?.close();
+    deliverySub?.close();
+    clearPlayRequest();
     observer?.disconnect();
     if (pollInterval) clearInterval(pollInterval);
     void releaseRuntimeSession();
@@ -455,6 +666,25 @@
   data-radio-loading-more={loadingMore}
   data-radio-has-more={hasMore}
 >
+  {#if playNotice}
+    <div
+      class="play-notice"
+      role="status"
+      aria-live="polite"
+      data-radio-play-notice={playNotice.state}
+    >
+      {#if playNotice.state === 'searching'}
+        <span>Looking for a station matching “{playNotice.label}”…</span>
+        <button type="button" class="inline-clear" onclick={clearPlayRequest}>Cancel</button>
+      {:else if playNotice.state === 'failed'}
+        <span>Stations matching “{playNotice.label}” were found, but none would play.</span>
+        <button type="button" class="inline-clear" onclick={clearPlayRequest}>Dismiss</button>
+      {:else}
+        <span>No station matches “{playNotice.label}”.</span>
+        <button type="button" class="inline-clear" onclick={clearPlayRequest}>Dismiss</button>
+      {/if}
+    </div>
+  {/if}
   {#if loading && stations.length === 0}
     <div class="station-grid" aria-busy="true" aria-label="Loading stations" data-radio-skeleton>
       {#each { length: 8 } as _}
@@ -535,7 +765,7 @@
             selected={playingId === stationKey(station)}
             failed={failedStationKey === stationKey(station)}
             {playbackStatus}
-            onselect={() => selectStation(station)}
+            onselect={() => selectStationByHand(station)}
           />
         {/each}
         <!-- Stations wait on a cover check before they're listed, so hold their place. -->
@@ -702,6 +932,18 @@
     grid-template-columns: repeat(auto-fill, minmax(min(100%, 190px), 1fr));
     gap: 20px 16px;
     padding: 14px;
+  }
+
+  .play-notice {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 8px 14px;
+    color: var(--hg-text-primary, #f2efe7);
+    font-size: 12px;
+    background: color-mix(in srgb, var(--hg-accent-primary, #5d5dff) 12%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--hg-accent-primary, #5d5dff) 35%, transparent);
   }
 
   .skeleton-card {
